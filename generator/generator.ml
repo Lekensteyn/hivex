@@ -2837,45 +2837,90 @@ put_handle (hive_h *h)
  * not be freed.
  */
 static int
-get_value (PyObject *v, hive_set_value *ret)
+get_value (PyObject *v, hive_set_value *ret, uint64_t *word)
 {
   PyObject *obj;
-#ifndef HAVE_PYSTRING_ASSTRING
   PyObject *bytes;
-#endif
+
+  if (!PyDict_Check (v)) {
+    PyErr_SetString (PyExc_TypeError, \"expected dictionary type for value\");
+    return -1;
+  }
 
   obj = PyDict_GetItemString (v, \"key\");
   if (!obj) {
-    PyErr_SetString (PyExc_RuntimeError, \"no 'key' element in dictionary\");
+    PyErr_SetString (PyExc_KeyError, \"no 'key' element in dictionary\");
     return -1;
   }
-#ifdef HAVE_PYSTRING_ASSTRING
-  ret->key = PyString_AsString (obj);
-#else
-  bytes = PyUnicode_AsUTF8String (obj);
+  if (PyUnicode_Check (obj)) {
+    bytes = PyUnicode_AsUTF8String (obj);
+    if (bytes == NULL) {
+      return -1;
+    }
+  } else if (PyBytes_Check (obj)) {
+    bytes = obj;
+  } else {
+    PyErr_SetString (PyExc_TypeError, \"expected bytes or str type for 'key'\");
+    return -1;
+  }
   ret->key = PyBytes_AS_STRING (bytes);
-#endif
 
   obj = PyDict_GetItemString (v, \"t\");
   if (!obj) {
-    PyErr_SetString (PyExc_RuntimeError, \"no 't' element in dictionary\");
+    PyErr_SetString (PyExc_KeyError, \"no 't' element in dictionary\");
     return -1;
   }
   ret->t = PyLong_AsLong (obj);
+  if (PyErr_Occurred ()) {
+    PyErr_SetString (PyExc_TypeError, \"expected int type for 't'\");
+    return -1;
+  }
 
   obj = PyDict_GetItemString (v, \"value\");
   if (!obj) {
-    PyErr_SetString (PyExc_RuntimeError, \"no 'value' element in dictionary\");
+    PyErr_SetString (PyExc_KeyError, \"no 'value' element in dictionary\");
     return -1;
   }
-#ifdef HAVE_PYSTRING_ASSTRING
-  ret->value = PyString_AsString (obj);
-  ret->len = PyString_Size (obj);
-#else
-  bytes = PyUnicode_AsUTF8String (obj);
-  ret->value = PyBytes_AS_STRING (bytes);
-  ret->len = PyBytes_GET_SIZE (bytes);
-#endif
+  /* Support bytes and unicode strings. For DWORD and QWORD types, long and
+   * integers are also supported. Caller must ensure sanity of byte buffer
+   * lengths */
+  if (PyUnicode_Check (obj)) {
+    bytes = PyUnicode_AsUTF8String (obj);
+    if (bytes == NULL)
+      return -1;
+    ret->len = PyBytes_GET_SIZE (bytes);
+    ret->value = PyBytes_AS_STRING (bytes);
+  } else if (PyBytes_Check (obj)) {
+    ret->len = PyBytes_GET_SIZE (obj);
+    ret->value = PyBytes_AS_STRING (obj);
+  } else if (ret->t == hive_t_REG_DWORD ||
+             ret->t == hive_t_REG_DWORD_BIG_ENDIAN) {
+    uint32_t d = PyLong_AsLong (obj);
+    if (PyErr_Occurred ()) {
+      PyErr_SetString (PyExc_TypeError, \"expected int type for DWORD value\");
+      return -1;
+    }
+
+    ret->len = sizeof (d);
+    ret->value = (char *) word;
+    if (ret->t == hive_t_REG_DWORD)
+      *(uint32_t *) ret->value = htole32 (d);
+    else
+      *(uint32_t *) ret->value = htobe32 (d);
+  } else if (ret->t == hive_t_REG_QWORD) {
+    uint64_t l = PyLong_AsLongLong (obj);
+    if (PyErr_Occurred ()) {
+      PyErr_SetString (PyExc_TypeError, \"expected int type for QWORD value\");
+      return -1;
+    }
+
+    ret->len = sizeof (l);
+    ret->value = (char *) word;
+    *(uint64_t *) ret->value = htole64 (l);
+  } else {
+    PyErr_SetString (PyExc_TypeError, \"expected bytes or str type for 'value'\");
+    return -1;
+  }
 
   return 0;
 }
@@ -2883,6 +2928,7 @@ get_value (PyObject *v, hive_set_value *ret)
 typedef struct py_set_values {
   size_t nr_values;
   hive_set_value *values;
+  uint64_t *words;
 } py_set_values;
 
 static int
@@ -2905,13 +2951,21 @@ get_values (PyObject *v, py_set_values *ret)
   ret->nr_values = len;
   ret->values = malloc (len * sizeof (hive_set_value));
   if (!ret->values) {
-    PyErr_SetString (PyExc_RuntimeError, strerror (errno));
+    PyErr_NoMemory ();
+    return -1;
+  }
+  /* if the value is a dword/qword, it will be stored here */
+  ret->words = malloc (len * sizeof (uint64_t));
+  if (!ret->words) {
+    free (ret->values);
+    PyErr_NoMemory ();
     return -1;
   }
 
   for (i = 0; i < len; ++i) {
-    if (get_value (PyList_GetItem (v, i), &(ret->values[i])) == -1) {
+    if (get_value (PyList_GetItem (v, i), &(ret->values[i]), &(ret->words[i])) == -1) {
       free (ret->values);
+      free (ret->words);
       return -1;
     }
   }
@@ -3070,9 +3124,10 @@ put_val_type (char *val, size_t len, hive_type t)
 	| ASetValues ->
 	    pr "  py_set_values values;\n";
 	    pr "  PyObject *py_values;\n"
-	| ASetValue ->
-	    pr "  hive_set_value val;\n";
-	    pr "  PyObject *py_val;\n"
+        | ASetValue ->
+            pr "  hive_set_value val;\n";
+            pr "  PyObject *py_val;\n";
+            pr "  uint64_t word;"
       ) (snd style);
 
       pr "\n";
@@ -3136,8 +3191,8 @@ put_val_type (char *val, size_t len, hive_type t)
 	| ASetValues ->
             pr "  if (get_values (py_values, &values) == -1)\n";
             pr "    return NULL;\n"
-	| ASetValue ->
-            pr "  if (get_value (py_val, &val) == -1)\n";
+        | ASetValue ->
+            pr "  if (get_value (py_val, &val, &word) == -1)\n";
             pr "    return NULL;\n"
       ) (snd style);
 
@@ -3151,8 +3206,9 @@ put_val_type (char *val, size_t len, hive_type t)
         | AString _ | AStringNullable _
 	| AOpenFlags | AUnusedFlags -> ()
 	| ASetValues ->
-	    pr "  free (values.values);\n"
-	| ASetValue -> ()
+            pr "  free (values.values);\n";
+            pr "  free (values.words);\n"
+        | ASetValue -> ()
       ) (snd style);
 
       (* Check for errors from C library. *)
