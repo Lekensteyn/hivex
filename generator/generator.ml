@@ -2840,42 +2840,95 @@ static int
 get_value (PyObject *v, hive_set_value *ret)
 {
   PyObject *obj;
-#ifndef HAVE_PYSTRING_ASSTRING
   PyObject *bytes;
-#endif
+
+  if (!PyDict_Check (v)) {
+    PyErr_SetString (PyExc_TypeError, \"expected dictionary type for value\");
+    return -1;
+  }
 
   obj = PyDict_GetItemString (v, \"key\");
   if (!obj) {
-    PyErr_SetString (PyExc_RuntimeError, \"no 'key' element in dictionary\");
+    PyErr_SetString (PyExc_KeyError, \"no 'key' element in dictionary\");
     return -1;
   }
-#ifdef HAVE_PYSTRING_ASSTRING
-  ret->key = PyString_AsString (obj);
-#else
-  bytes = PyUnicode_AsUTF8String (obj);
+  if (PyUnicode_Check (obj)) {
+    bytes = PyUnicode_AsUTF8String (obj);
+    if (bytes == NULL) {
+      return -1;
+    }
+  } else if (PyBytes_Check (obj)) {
+    bytes = obj;
+  } else {
+    PyErr_SetString (PyExc_TypeError, \"expected bytes or str type for 'key'\");
+    return -1;
+  }
   ret->key = PyBytes_AS_STRING (bytes);
-#endif
 
   obj = PyDict_GetItemString (v, \"t\");
   if (!obj) {
-    PyErr_SetString (PyExc_RuntimeError, \"no 't' element in dictionary\");
+    PyErr_SetString (PyExc_KeyError, \"no 't' element in dictionary\");
     return -1;
   }
   ret->t = PyLong_AsLong (obj);
+  if (PyErr_Occurred ()) {
+    PyErr_SetString (PyExc_TypeError, \"expected int type for 't'\");
+    return -1;
+  }
 
   obj = PyDict_GetItemString (v, \"value\");
   if (!obj) {
-    PyErr_SetString (PyExc_RuntimeError, \"no 'value' element in dictionary\");
+    PyErr_SetString (PyExc_KeyError, \"no 'value' element in dictionary\");
     return -1;
   }
-#ifdef HAVE_PYSTRING_ASSTRING
-  ret->value = PyString_AsString (obj);
-  ret->len = PyString_Size (obj);
-#else
-  bytes = PyUnicode_AsUTF8String (obj);
-  ret->value = PyBytes_AS_STRING (bytes);
-  ret->len = PyBytes_GET_SIZE (bytes);
-#endif
+  /* Support bytes and unicode strings. For DWORD and QWORD types, long and
+   * integers are also supported. Caller must ensure sanity of byte buffer
+   * lengths */
+  if (PyUnicode_Check (obj)) {
+    bytes = PyUnicode_AsUTF8String (obj);
+    if (bytes == NULL)
+      return -1;
+    ret->len = PyBytes_GET_SIZE (bytes);
+    ret->value = PyBytes_AS_STRING (bytes);
+  } else if (PyBytes_Check (obj)) {
+    ret->len = PyBytes_GET_SIZE (obj);
+    ret->value = PyBytes_AS_STRING (obj);
+  } else if (ret->t == hive_t_REG_DWORD ||
+             ret->t == hive_t_REG_DWORD_BIG_ENDIAN) {
+    uint32_t d = PyLong_AsLong (obj);
+    if (PyErr_Occurred ()) {
+      PyErr_SetString (PyExc_TypeError, \"expected int type for DWORD value\");
+      return -1;
+    }
+
+    ret->len = sizeof (d);
+    ret->value = malloc (ret->len);
+    if (ret->value == NULL) {
+      PyErr_NoMemory ();
+      return -1;
+    }
+    if (ret->t == hive_t_REG_DWORD)
+      *(uint32_t *) ret->value = htole32 (d);
+    else
+      *(uint32_t *) ret->value = htobe32 (d);
+  } else if (ret->t == hive_t_REG_QWORD) {
+    uint64_t l = PyLong_AsLongLong (obj);
+    if (PyErr_Occurred ()) {
+      PyErr_SetString (PyExc_TypeError, \"expected int type for QWORD value\");
+      return -1;
+    }
+
+    ret->len = sizeof (l);
+    ret->value = malloc (ret->len);
+    if (ret->value == NULL) {
+      PyErr_NoMemory ();
+      return -1;
+    }
+    *(uint64_t *) ret->value = htole64 (l);
+  } else {
+    PyErr_SetString (PyExc_TypeError, \"expected bytes or str type for 'value'\");
+    return -1;
+  }
 
   return 0;
 }
