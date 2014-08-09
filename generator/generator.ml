@@ -3310,6 +3310,10 @@ moduleinit (void)
   m = Py_InitModule ((char *) \"libhivexmod\", methods);
 #endif
 
+  if (m) {
+    PyModule_AddStringConstant (m, \"__version__\", PACKAGE_VERSION);
+  }
+
   return m; /* m might be NULL if module init failed */
 }
 
@@ -3344,6 +3348,8 @@ Read the hivex(3) man page to find out how to use the API.
 \"\"\"
 
 import libhivexmod
+
+__version__ = libhivexmod.__version__
 
 class Hivex(object):
     \"\"\"Instances of this class are hivex API handles.\"\"\"
